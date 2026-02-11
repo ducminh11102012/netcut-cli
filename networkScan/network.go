@@ -22,47 +22,54 @@ type NetworkScanner struct {
 	localMAC net.HardwareAddr
 }
 
-func NewNetworkScanner(ifaceName string) *NetworkScanner {
+func NewNetworkScanner(pcapName string) *NetworkScanner {
 
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(pcapName, 65536, true, pcap.BlockForever)
 	if err != nil {
-		log.Fatalf("Error opening device %s: %v", ifaceName, err)
+		log.Fatalf("Error opening device %s: %v", pcapName, err)
 	}
 
-	// Chỉ bắt ARP cho sạch
-	if err := handle.SetBPFFilter("arp"); err != nil {
-		log.Fatalf("Error setting BPF filter: %v", err)
-	}
-
-	iface, err := net.InterfaceByName(ifaceName)
+	devices, err := pcap.FindAllDevs()
 	if err != nil {
-		log.Fatalf("Error getting interface %s: %v", ifaceName, err)
-	}
-
-	addrs, err := iface.Addrs()
-	if err != nil {
-		log.Fatalf("Error getting addresses for interface %s: %v", ifaceName, err)
+		log.Fatal(err)
 	}
 
 	var localIP net.IP
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok {
-			ip := ipnet.IP.To4()
-			if ip != nil {
-				localIP = ip
-				break
+	var localMAC net.HardwareAddr
+
+	for _, d := range devices {
+		if d.Name == pcapName {
+			for _, addr := range d.Addresses {
+				if addr.IP.To4() != nil {
+					localIP = addr.IP.To4()
+					break
+				}
+			}
+			break
+		}
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				if ipnet.IP.To4() != nil && ipnet.IP.Equal(localIP) {
+					localMAC = i.HardwareAddr
+					break
+				}
 			}
 		}
 	}
 
-	if localIP == nil {
-		log.Fatalf("No IPv4 found on interface %s", ifaceName)
+	if localIP == nil || localMAC == nil {
+		log.Fatal("Could not determine local IP/MAC")
 	}
 
 	return &NetworkScanner{
 		handle:   handle,
 		localIP:  localIP,
-		localMAC: iface.HardwareAddr,
+		localMAC: localMAC,
 	}
 }
 
