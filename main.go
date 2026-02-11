@@ -4,25 +4,44 @@ import (
 	"flag"
 	"log"
 	"net"
-	"runtime"
+	"os"
+	"strings"
 
 	"github.com/enigma522/netcut-cli/networkScan"
+	"github.com/google/gopacket/pcap"
 )
 
-func getDefaultInterface() string {
-	if runtime.GOOS == "windows" {
-		ifaces, err := net.Interfaces()
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, i := range ifaces {
-			if (i.Flags&net.FlagUp) != 0 && (i.Flags&net.FlagLoopback) == 0 {
-				return i.Name
+func getPcapInterface(name string) string {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Fatal("Cannot list devices:", err)
+	}
+
+	// Nếu user truyền -i thì tìm đúng device đó
+	if name != "" {
+		for _, d := range devices {
+			if d.Name == name || strings.Contains(d.Description, name) {
+				return d.Name
 			}
 		}
-		log.Fatal("No active network interface found")
+		log.Println("Interface not found. Available devices:")
+		for _, d := range devices {
+			log.Println(d.Name, "->", d.Description)
+		}
+		os.Exit(1)
 	}
-	return "wlp49s0"
+
+	// Auto chọn device có IPv4
+	for _, d := range devices {
+		for _, addr := range d.Addresses {
+			if addr.IP.To4() != nil {
+				return d.Name
+			}
+		}
+	}
+
+	log.Fatal("No suitable interface found")
+	return ""
 }
 
 func main() {
@@ -30,44 +49,46 @@ func main() {
 	scanFlag := flag.Bool("scan", false, "Scan the network")
 	CIDR := flag.String("cidr", "", "CIDR for the network scan")
 	cutFlag := flag.Bool("cut", false, "Cut off a device")
-	ipAddr := flag.String("ip", "", "IP address of the device to cut off")
-	mac := flag.String("mac", "", "MAC address of the device to cut off")
+	ipAddr := flag.String("ip", "", "IP address of the device")
+	mac := flag.String("mac", "", "MAC address of the device")
 	gateway := flag.String("g", "", "Gateway IP address")
-	ifaceName := flag.String("i", "", "Interface name")
+	ifaceName := flag.String("i", "", "Interface name (pcap format)")
 	flag.Parse()
 
-	if *ifaceName == "" {
-		*ifaceName = getDefaultInterface()
-	}
+	selectedIface := getPcapInterface(*ifaceName)
 
-	log.Printf("Using interface: %s\n", *ifaceName)
+	log.Println("Using interface:", selectedIface)
 
-	scanner := networkscan.NewNetworkScanner(*ifaceName)
+	scanner := networkscan.NewNetworkScanner(selectedIface)
 	defer scanner.Close()
 
 	if *scanFlag {
+		if *CIDR == "" {
+			log.Fatal("CIDR required when using -scan")
+		}
 		scanner.NetScan(*CIDR)
 	}
 
 	if *cutFlag {
+
 		if *ipAddr == "" {
-			log.Fatal("IP address is required when using the cut option.")
+			log.Fatal("IP required when using -cut")
 		}
 
 		var deviceToCut *networkscan.Device
 
 		if *mac == "" {
 			devices := scanner.NetScan(*ipAddr + "/32")
-			for _, device := range devices {
-				if device.IP.String() == *ipAddr {
-					deviceToCut = &device
+			for _, d := range devices {
+				if d.IP.String() == *ipAddr {
+					deviceToCut = &d
 					break
 				}
 			}
 		} else {
 			macAddr, err := net.ParseMAC(*mac)
 			if err != nil {
-				log.Fatalf("Error parsing MAC address: %v", err)
+				log.Fatal("Invalid MAC:", err)
 			}
 			deviceToCut = &networkscan.Device{
 				IP:  net.ParseIP(*ipAddr),
@@ -76,11 +97,12 @@ func main() {
 		}
 
 		if deviceToCut != nil {
-			log.Printf("Cut off device: IP: %s, MAC: %s\n",
+			log.Printf("Cut off device: IP=%s MAC=%s\n",
 				deviceToCut.IP, deviceToCut.MAC)
+
 			scanner.CutOffDevice(*deviceToCut, *gateway)
 		} else {
-			log.Printf("Device with IP: %s not found\n", *ipAddr)
+			log.Println("Device not found")
 		}
 	}
 }
